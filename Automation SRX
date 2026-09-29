@@ -1,0 +1,128 @@
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    junos = {
+      source  = "juniper/junos"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "junos" {
+  ip           = "10.20.2.1"
+  username     = "admin"
+  password     = "your-secure-password"
+  sshkey       = "/path/to/id_rsa"
+  netconf_port = 830
+}
+
+
+# Trunk/VLAN-tagged physical interface
+resource "junos_interface_physical" "ge_0_0_0" {
+  name        = "ge-0/0/0"
+  description = "Trunk Interface with VLANs"
+  vlan_tagging = true
+}
+
+# Sub-interface Unit 40 with IP 10.20.30.40/24 on VLAN ID 40
+resource "junos_interface_logical" "ge_0_0_0_unit40" {
+  name        = "${junos_interface_physical.ge_0_0_0.name}.40"
+  description = "VLAN 40 Sub-Interface"
+  vlan_id     = 40
+
+  family_inet {
+    address {
+      cidr_ip = "10.20.30.40/24"
+    }
+  }
+}
+
+# Sub-interface Unit 4 for LAN 192.168.4.0/24 network
+resource "junos_interface_logical" "ge_0_0_0_unit4" {
+  name        = "${junos_interface_physical.ge_0_0_0.name}.4"
+  description = "LAN Network 192.168.4.0/24"
+  vlan_id     = 4
+
+  family_inet {
+    address {
+      cidr_ip = "192.168.4.1/24"
+    }
+  }
+}
+
+# Transit Interface (10.20.2.1/24 network)
+resource "junos_interface_physical" "ge_0_0_1" {
+  name        = "ge-0/0/1"
+  description = "Transit Link to BGP/OSPF Peer"
+}
+
+resource "junos_interface_logical" "ge_0_0_1_unit0" {
+  name          = "${junos_interface_physical.ge_0_0_1.name}.0"
+  family_inet {
+    address {
+      cidr_ip = "10.20.2.1/24"
+    }
+  }
+}
+
+resource "junos_routing_options" "router_id" {
+  router_id         = "10.20.2.1"
+  autonomous_system = 65001
+}
+
+# BGP Community 40 Match (65001:40)
+resource "junos_policyoptions_community" "comm_40" {
+  name    = "COMM_MATCH_40"
+  members = ["65001:40"]
+}
+
+# BGP Import Policy Statement
+resource "junos_policyoptions_policy_statement" "bgp_in_filter" {
+  name = "BGP_IN_FILTER"
+
+  from {
+    community = [junos_policyoptions_community.comm_40.name]
+  }
+
+  then {
+    action          = "accept"
+    as_path_prepend = "65001 65001"
+  }
+}
+
+
+resource "junos_ospf_area" "area_0" {
+  identifier = "0.0.0.0"
+
+  # Include VLAN 40 logical interface in OSPF
+  interface {
+    name          = junos_interface_logical.ge_0_0_0_unit40.name
+    interface_type = "p2p"
+  }
+
+  # Include LAN 192.168.4.0 interface in OSPF
+  interface {
+    name          = junos_interface_logical.ge_0_0_0_unit4.name
+    interface_type = "p2p"
+  }
+
+  # Include Transit 10.20.2.1 interface in OSPF
+  interface {
+    name          = junos_interface_logical.ge_0_0_1_unit0.name
+    interface_type = "p2p"
+  }
+}
+
+resource "junos_bgp_group" "ebgp_peers" {
+  name     = "EBGP_PEERS"
+  type     = "external"
+  local_as = 65001
+  import   = [junos_policyoptions_policy_statement.bgp_in_filter.name]
+}
+
+resource "junos_bgp_neighbor" "peer_10_20_10_1" {
+  group         = junos_bgp_group.ebgp_peers.name
+  ip            = "10.20.10.1"
+  peer_as       = 65002
+  local_address = "10.20.2.1"
+}
